@@ -1,0 +1,134 @@
+# =============================================================================
+# Vault Server — Taz Currency Microservice
+# docker-compose.yml
+#
+# SECURITY DESIGN:
+#   - vault_internal network uses internal: true → both containers are
+#     completely blocked from outbound internet access at the Docker level.
+#   - The 'db' service has NO port bindings whatsoever; it is unreachable
+#     from outside the Docker network.
+#   - The 'bridge' (FastAPI) service binds ONLY to the Hostinger private VPC
+#     IP (VAULT_INTERNAL_IP). The public interface of this machine will never
+#     accept connections on port 8000.
+#   - All credentials are injected via .env — never hard-coded here.
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — The Vault's sole source of truth for all Taz balances.
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: vault_db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      # Persistent data volume — survives container restarts.
+      - postgres_data:/var/lib/postgresql/data
+      # Initialization SQL — runs once on first boot (empty data dir).
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+    networks:
+      - vault_internal
+
+    # NO ports: block — db is completely inaccessible from the host or internet.
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    # Limit resources to prevent runaway processes.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Bridge — FastAPI internal API that mediates all access to the Vault DB.
+  #
+  # Network topology (two-network design):
+  #   vault_internal  (internal: true)  → reaches the DB, no internet
+  #   vault_edge      (internal: false) → exposes port 8000 to the VPC IP
+  #
+  # Why two networks?
+  #   Docker suppresses DNAT iptables rules for containers whose ONLY network
+  #   is marked internal: true. To publish a port we need at least one
+  #   non-internal network attached to the container.
+  #   The DB service remains on vault_internal ONLY, so it is still
+  #   completely unreachable from the host or the internet.
+  # ---------------------------------------------------------------------------
+  bridge:
+    build:
+      context: ./bridge
+      dockerfile: Dockerfile
+    container_name: vault_bridge
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL:         ${DATABASE_URL}
+      VAULT_INTERNAL_KEYS:  ${VAULT_INTERNAL_KEYS}
+      VAULT_ADMIN_KEYS:     ${VAULT_ADMIN_KEYS}
+      TREASURY_WALLET_ID:   ${TREASURY_WALLET_ID}
+      ESCROW_WALLET_ID:     ${ESCROW_WALLET_ID}
+      TAZO_FEE_PCT:         ${TAZO_FEE_PCT}
+      SMS_THRESHOLD_NIS:    ${SMS_THRESHOLD_NIS}
+      TAZO_GO_WEBHOOK_URL:  ${TAZO_GO_WEBHOOK_URL}
+      TAZO_GO_INTERNAL_KEY: ${TAZO_GO_INTERNAL_KEY}
+      TAZO_ADMIN_PHONE:     ${TAZO_ADMIN_PHONE}
+      TWILIO_ACCOUNT_SID:   ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN:    ${TWILIO_AUTH_TOKEN}
+      TWILIO_FROM_PHONE:    ${TWILIO_FROM_PHONE}
+
+    # CRITICAL: Bind exclusively to the Hostinger private VPC IP.
+    # The public IP of this server will never serve port 8000.
+    # Replace VAULT_INTERNAL_IP in .env with your actual VPC IP (e.g. 10.0.0.4).
+    ports:
+      - "${VAULT_INTERNAL_IP}:8000:8000"
+
+    networks:
+      - vault_internal   # DB access (air-gapped, no internet)
+      - vault_edge       # Port publishing to VPC IP (host-level DNAT)
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  vault_internal:
+    driver: bridge
+    # internal: true → containers on this network cannot reach the internet.
+    # The DB lives here exclusively — zero external exposure.
+    internal: true
+
+  vault_edge:
+    driver: bridge
+    # Non-internal bridge used solely so Docker activates the DNAT rule
+    # for the port binding above. Bridge has no default route added to
+    # non-db containers so outbound traffic is limited to the host network.
+    internal: false
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
