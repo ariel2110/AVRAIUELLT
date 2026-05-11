@@ -96,6 +96,7 @@ ESCROW_WALLET_ID: str = os.environ.get("ESCROW_WALLET_ID", "").strip()
 # TAZO platform fee percentage (e.g. "15" = 15%).  Driver receives the rest.
 _CENT = Decimal("0.01")
 TAZO_FEE_PCT: Decimal = Decimal(os.environ.get("TAZO_FEE_PCT", "15"))
+WELCOME_BONUS_TAZ: Decimal = Decimal(os.environ.get("WELCOME_BONUS_TAZ", "30"))
 
 # Twilio SMS — admin notifications on high-value or failed transactions.
 TWILIO_ACCOUNT_SID: str  = os.environ.get("TWILIO_ACCOUNT_SID",  "").strip()
@@ -386,8 +387,9 @@ class TransactionResponse(BaseModel):
 
 
 class WalletCreateRequest(BaseModel):
-    user_id:      UUID    = Field(..., description="The user_id to register in the Vault. Must be the canonical UUID from the User service.")
-    credit_limit: Decimal = Field(Decimal("0"), ge=0, description="Initial credit limit in Taz. Defaults to 0.")
+    user_id:       UUID    = Field(..., description="The user_id to register in the Vault. Must be the canonical UUID from the User service.")
+    credit_limit:  Decimal = Field(Decimal("0"), ge=0, description="Initial credit limit in Taz. Defaults to 0.")
+    welcome_bonus: bool    = Field(True, description="If True, credits WELCOME_BONUS_TAZ Taz from Treasury on wallet creation.")
 
 
 class WalletCreateResponse(BaseModel):
@@ -395,6 +397,22 @@ class WalletCreateResponse(BaseModel):
     balance:      Decimal
     credit_limit: Decimal
     created_at:   Any  # TIMESTAMPTZ returned as-is from DB
+
+
+class TopupRequest(BaseModel):
+    wallet_id: UUID    = Field(..., description="Target wallet to credit.")
+    amount:    Decimal = Field(..., gt=0, description="Amount paid in ILS (1 ILS = 1 Taz). 10% bonus auto-added.")
+    reference: str     = Field("", max_length=128, description="GreenInvoice document ID or payment reference.")
+
+
+class TopupResponse(BaseModel):
+    topup_tx_id:    UUID
+    bonus_tx_id:    UUID
+    wallet_id:      UUID
+    base_amount:    Decimal
+    bonus_amount:   Decimal
+    total_credited: Decimal
+    reference:      str
 
 
 class MintRequest(BaseModel):
@@ -753,7 +771,7 @@ async def transfer(
         )
 
     # Sanitise transaction_type to prevent injection into the ledger.
-    allowed_types = {"TRANSFER", "ESCROW_LOCK", "ESCROW_RELEASE", "REFUND", "MINTING"}
+    allowed_types = {"TRANSFER", "ESCROW_LOCK", "ESCROW_RELEASE", "REFUND", "MINTING", "TOPUP", "BONUS"}
     txn_type = payload.transaction_type.upper()
     if txn_type not in allowed_types:
         raise HTTPException(
@@ -953,6 +971,49 @@ async def create_wallet(
         ) from exc
 
     logger.info("Wallet created — user=%s credit_limit=%s", user_id_str, payload.credit_limit)
+
+    # ── Welcome bonus: best-effort credit from Treasury ───────────────────────
+    if payload.welcome_bonus and TREASURY_WALLET_ID:
+        try:
+            treasury_id  = TREASURY_WALLET_ID
+            bonus_amount = WELCOME_BONUS_TAZ
+            uid_a, uid_b = sorted([treasury_id, user_id_str])
+            async with AsyncSessionFactory() as bonus_db:
+                async with bonus_db.begin():
+                    tbal = await bonus_db.execute(
+                        text("SELECT balance FROM users_taz_balance WHERE user_id = :uid FOR UPDATE"),
+                        {"uid": treasury_id},
+                    )
+                    trow = tbal.mappings().first()
+                    if trow and Decimal(str(trow["balance"])) >= bonus_amount:
+                        await bonus_db.execute(
+                            text("UPDATE users_taz_balance SET balance = balance - :amt WHERE user_id = :uid"),
+                            {"amt": str(bonus_amount), "uid": treasury_id},
+                        )
+                        await bonus_db.execute(
+                            text("UPDATE users_taz_balance SET balance = balance + :amt WHERE user_id = :uid"),
+                            {"amt": str(bonus_amount), "uid": user_id_str},
+                        )
+                        await bonus_db.execute(
+                            text(
+                                "INSERT INTO transaction_ledger "
+                                "(transaction_id, from_user, to_user, amount, status, transaction_type) "
+                                "VALUES (:txn_id, :from_user, :to_user, :amount, 'completed', 'BONUS')"
+                            ),
+                            {
+                                "txn_id":    str(uuid.uuid4()),
+                                "from_user": treasury_id,
+                                "to_user":   user_id_str,
+                                "amount":    str(bonus_amount),
+                            },
+                        )
+                        logger.info(
+                            "Welcome bonus %s Taz credited to new wallet %s", bonus_amount, user_id_str
+                        )
+                    else:
+                        logger.warning("Treasury low — welcome bonus skipped for %s", user_id_str)
+        except Exception as bonus_exc:
+            logger.error("Welcome bonus failed for %s: %s", user_id_str, bonus_exc)
 
     return WalletCreateResponse(**row)
 
@@ -1532,4 +1593,151 @@ async def escrow_release(
         driver_wallet=uuid.UUID(driver_id),
         treasury_wallet=uuid.UUID(treasury_id),
         status="released",
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /wallets/topup
+# ---------------------------------------------------------------------------
+
+@app.post("/wallets/topup", response_model=TopupResponse, status_code=201)
+@limiter.limit("30/minute")
+async def topup_wallet(
+    request: Request,
+    payload: TopupRequest,
+    _auth: VaultAuth,
+    db: DBSession,
+) -> TopupResponse:
+    """
+    Top-up a user wallet from the Treasury (GreenInvoice payment confirmed).
+
+    Mechanics:
+      - base_amount    = payload.amount            (1 ILS → 1 Taz)
+      - bonus_amount   = round(base * 10%, 2)      (10% gift)
+      - total_credited = base_amount + bonus_amount
+
+    Both amounts transfer from Treasury → user wallet in a single ACID transaction.
+    Two ledger entries: TOPUP (base) and BONUS (10% gift).
+
+    Returns 404 if target wallet does not exist.
+    Returns 503 if Treasury is not configured or has insufficient balance.
+    Rate limit: 30 requests/minute per calling IP.
+    """
+    if not TREASURY_WALLET_ID:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Treasury wallet not configured on Vault.",
+        )
+
+    user_id_str  = str(payload.wallet_id)
+    treasury_id  = TREASURY_WALLET_ID
+    base_amount  = payload.amount.quantize(_CENT, rounding=ROUND_HALF_UP)
+    bonus_amount = (base_amount * Decimal("0.10")).quantize(_CENT, rounding=ROUND_HALF_UP)
+    total        = base_amount + bonus_amount
+    uid_a, uid_b = sorted([treasury_id, user_id_str])
+
+    topup_txn_id: str = ""
+    bonus_txn_id: str = ""
+
+    try:
+        async with db.begin():
+            # 1. Lock both rows in sorted order (deadlock prevention).
+            result = await db.execute(
+                text(
+                    "SELECT user_id, balance "
+                    "FROM users_taz_balance "
+                    "WHERE user_id IN (:uid_a, :uid_b) "
+                    "ORDER BY user_id FOR UPDATE"
+                ),
+                {"uid_a": uid_a, "uid_b": uid_b},
+            )
+            rows = {str(r["user_id"]): r for r in result.mappings().all()}
+
+            # 2. Validate.
+            if user_id_str not in rows:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Wallet {payload.wallet_id} not found in Vault.",
+                )
+            if treasury_id not in rows:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Treasury wallet not found in Vault.",
+                )
+
+            treasury_balance = Decimal(str(rows[treasury_id]["balance"]))
+            if treasury_balance < total:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=(
+                        f"Treasury insufficient: {treasury_balance} Taz available, "
+                        f"{total} Taz needed."
+                    ),
+                )
+
+            # 3. Debit Treasury, credit user.
+            await db.execute(
+                text("UPDATE users_taz_balance SET balance = balance - :amt WHERE user_id = :uid"),
+                {"amt": str(total), "uid": treasury_id},
+            )
+            await db.execute(
+                text("UPDATE users_taz_balance SET balance = balance + :amt WHERE user_id = :uid"),
+                {"amt": str(total), "uid": user_id_str},
+            )
+
+            # 4a. TOPUP ledger entry (base amount).
+            topup_txn_id = str(uuid.uuid4())
+            await db.execute(
+                text(
+                    "INSERT INTO transaction_ledger "
+                    "(transaction_id, from_user, to_user, amount, status, transaction_type) "
+                    "VALUES (:txn_id, :from_user, :to_user, :amount, 'completed', 'TOPUP')"
+                ),
+                {
+                    "txn_id":    topup_txn_id,
+                    "from_user": treasury_id,
+                    "to_user":   user_id_str,
+                    "amount":    str(base_amount),
+                },
+            )
+
+            # 4b. BONUS ledger entry (10% gift).
+            bonus_txn_id = str(uuid.uuid4())
+            await db.execute(
+                text(
+                    "INSERT INTO transaction_ledger "
+                    "(transaction_id, from_user, to_user, amount, status, transaction_type) "
+                    "VALUES (:txn_id, :from_user, :to_user, :amount, 'completed', 'BONUS')"
+                ),
+                {
+                    "txn_id":    bonus_txn_id,
+                    "from_user": treasury_id,
+                    "to_user":   user_id_str,
+                    "amount":    str(bonus_amount),
+                },
+            )
+
+        logger.info(
+            "TOPUP — topup_txn=%s bonus_txn=%s wallet=%s base=%s bonus=%s total=%s ref=%r",
+            topup_txn_id, bonus_txn_id, user_id_str,
+            base_amount, bonus_amount, total, payload.reference,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("TOPUP failed — wallet=%s: %s", user_id_str, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Top-up failed due to an internal error.",
+        ) from exc
+
+    return TopupResponse(
+        topup_tx_id=uuid.UUID(topup_txn_id),
+        bonus_tx_id=uuid.UUID(bonus_txn_id),
+        wallet_id=payload.wallet_id,
+        base_amount=base_amount,
+        bonus_amount=bonus_amount,
+        total_credited=total,
+        reference=payload.reference,
     )
