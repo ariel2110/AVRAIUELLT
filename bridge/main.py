@@ -165,32 +165,63 @@ async def _fire_payment_locked_webhook(
     Notify Tazo-Go that an escrow lock succeeded so it can auto-dispatch.
     Called inside the /escrow/lock handler after a successful DB commit.
     Fire-and-forget — Vault does not block on Tazo-Go's response.
+
+    Retries transient failures (network errors, 5xx, 429) with exponential
+    backoff. Does not retry on other 4xx (client errors).
     """
     if not TAZO_GO_WEBHOOK_URL or not TAZO_GO_INTERNAL_KEY:
         return
     import httpx
-    target = f"{TAZO_GO_WEBHOOK_URL}/webhooks/payment-locked"
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            resp = await client.post(
-                target,
-                headers={"x-internal-key": TAZO_GO_INTERNAL_KEY},
-                json={
-                    "order_id":        order_id,
-                    "vault_tx_id":     vault_tx_id,
-                    "amount":          str(amount),
-                    "buyer_wallet_id": buyer_wallet_id,
-                },
-            )
-        if resp.status_code not in (200, 201):
+
+    target = f"{TAZO_GO_WEBHOOK_URL.rstrip('/')}/webhooks/payment-locked"
+    payload = {
+        "order_id": order_id,
+        "vault_tx_id": vault_tx_id,
+        "amount": str(amount),
+        "buyer_wallet_id": buyer_wallet_id,
+    }
+    headers = {
+        "x-internal-key": TAZO_GO_INTERNAL_KEY,
+        "Idempotency-Key": vault_tx_id,
+    }
+    max_attempts = 3
+    base_delay_s = 0.5
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.post(target, headers=headers, json=payload)
+            if resp.status_code in (200, 201):
+                logger.info("payment.locked webhook fired — order=%s", order_id)
+                return
+            if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                logger.warning(
+                    "payment.locked webhook → Tazo-Go returned %s (no retry): %s",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+                return
             logger.warning(
-                "payment.locked webhook → Tazo-Go returned %s: %s",
-                resp.status_code, resp.text[:200],
+                "payment.locked webhook attempt %s/%s → HTTP %s: %s",
+                attempt,
+                max_attempts,
+                resp.status_code,
+                resp.text[:200],
             )
-        else:
-            logger.info("payment.locked webhook fired — order=%s", order_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("payment.locked webhook failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "payment.locked webhook attempt %s/%s failed: %s",
+                attempt,
+                max_attempts,
+                exc,
+            )
+        if attempt < max_attempts:
+            await asyncio.sleep(base_delay_s * (2 ** (attempt - 1)))
+    logger.warning(
+        "payment.locked webhook exhausted retries — order=%s vault_tx=%s",
+        order_id,
+        vault_tx_id,
+    )
 
 # ---------------------------------------------------------------------------
 # Database engine — SQLAlchemy 2 async with asyncpg
