@@ -27,6 +27,7 @@ SECURITY ARCHITECTURE:
 
 import asyncio
 import hashlib
+import base64
 import hmac
 import logging
 import os
@@ -39,7 +40,8 @@ from uuid import UUID
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -275,6 +277,81 @@ app = FastAPI(
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ---------------------------------------------------------------------------
+# Protected Swagger UI — Basic Auth (user: vault, pass: VAULT_ADMIN_KEY)
+# ---------------------------------------------------------------------------
+
+_DOCS_USER = "vault"
+_DOCS_PASS_HASH = hashlib.sha256(
+    os.environ["VAULT_ADMIN_KEYS"].split(",")[0].strip().encode()
+).hexdigest()
+
+
+def _check_docs_auth(request: Request) -> None:
+    """Raise 401 with WWW-Authenticate if Basic Auth is missing/wrong."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Basic "):
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": 'Basic realm="Vault Docs"'},
+        )
+    try:
+        decoded = base64.b64decode(auth[6:]).decode()
+        user, _, password = decoded.partition(":")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid credentials",
+                            headers={"WWW-Authenticate": 'Basic realm="Vault Docs"'})
+    user_ok = hmac.compare_digest(user, _DOCS_USER)
+    pass_ok = hmac.compare_digest(
+        hashlib.sha256(password.encode()).hexdigest(), _DOCS_PASS_HASH
+    )
+    if not (user_ok and pass_ok):
+        raise HTTPException(status_code=401, detail="Invalid credentials",
+                            headers={"WWW-Authenticate": 'Basic realm="Vault Docs"'})
+
+
+@app.get("/vault-docs", include_in_schema=False)
+async def vault_docs(request: Request):
+    _check_docs_auth(request)
+    html = f"""
+    <!DOCTYPE html><html>
+    <head>
+      <title>Vault Bridge — API Docs</title>
+      <meta charset="utf-8"/>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+    </head>
+    <body>
+      <div id="swagger-ui"></div>
+      <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+      <script>
+        SwaggerUIBundle({{
+          url: "/vault-openapi.json",
+          dom_id: '#swagger-ui',
+          presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+          layout: "BaseLayout",
+          deepLinking: true,
+          requestInterceptor: (req) => {{
+            req.headers['X-Internal-Key'] = prompt('X-Internal-Key (leave blank to skip)') || '';
+            return req;
+          }}
+        }})
+      </script>
+    </body></html>
+    """
+    return HTMLResponse(html)
+
+
+@app.get("/vault-openapi.json", include_in_schema=False)
+async def vault_openapi(request: Request):
+    _check_docs_auth(request)
+    return JSONResponse(get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+    ))
 
 # ---------------------------------------------------------------------------
 # Middleware — structured request logging with header masking
