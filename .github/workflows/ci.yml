@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  vault-bridge:
+    name: Vault Bridge (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bridge
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: vault
+          POSTGRES_PASSWORD: vault
+          POSTGRES_DB: vault_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: "postgresql+asyncpg://vault:vault@localhost:5432/vault_test"
+      VAULT_INTERNAL_KEYS: "ci-test-internal-key-placeholder"
+      VAULT_ADMIN_KEYS: "ci-test-admin-key-placeholder"
+      TREASURY_WALLET_ID: "00000000-0000-0000-0000-000000000001"
+      # Test-side keys (match env above — never real secrets)
+      VAULT_TEST_INTERNAL_KEY: "ci-test-internal-key-placeholder"
+      VAULT_TEST_ADMIN_KEY: "ci-test-admin-key-placeholder"
+      VAULT_TEST_TREASURY_ID: "00000000-0000-0000-0000-000000000001"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: bridge/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pytest-asyncio httpx
+
+      - name: Run tests
+        run: python -m pytest tests/ -q --tb=short
