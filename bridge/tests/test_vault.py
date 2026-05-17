@@ -2,14 +2,18 @@
 Tests for vault.com TAZ Currency Vault API.
 Run inside vault_bridge container:
   python3 -m pytest /app/tests/test_vault.py -v
+
+Keys are loaded from env vars so that real secrets are never committed.
+CI supplies dummy values via the workflow env block.
 """
+import os
 import uuid
 import pytest
 from httpx import AsyncClient, ASGITransport
 
-INTERNAL_KEY = 'f1443b9f620553a01ae6a88ee2846d14b92b79d8451fc13d79ac1c3899bff6c5'
-ADMIN_KEY    = 'c9e9163c0b6bdd8db6ab0dbdd926d9aebe06d717eed05df08d718321d99a3186'
-TREASURY_ID  = '912a0289-6bcb-4631-9ff6-10993720bad8'
+INTERNAL_KEY = os.environ.get('VAULT_TEST_INTERNAL_KEY', 'ci-test-internal-key-placeholder')
+ADMIN_KEY    = os.environ.get('VAULT_TEST_ADMIN_KEY',    'ci-test-admin-key-placeholder')
+TREASURY_ID  = os.environ.get('VAULT_TEST_TREASURY_ID',  '00000000-0000-0000-0000-000000000001')
 
 IH = {'X-Vault-Internal-Key': INTERNAL_KEY}
 AH = {'X-Vault-Admin-Key':    ADMIN_KEY}
