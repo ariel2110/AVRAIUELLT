@@ -1,22 +1,17 @@
 name: Deploy — Production
 
 on:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
+  push:
     branches: [main]
 
-# Prevent concurrent deployments
 concurrency:
   group: production
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Deploy Vault bridge
+    name: Deploy to vault
     runs-on: ubuntu-latest
-    # Only deploy when CI passed
-    if: github.event.workflow_run.conclusion == 'success'
 
     steps:
       - name: Deploy via SSH
@@ -28,18 +23,9 @@ jobs:
           port: 22
           script: |
             set -e
-            cd /root/vault   # adjust if repo was cloned elsewhere
-
-            echo "→ Pulling latest code…"
+            cd /root/vault
+            echo '→ Pulling latest code…'
             git pull origin main
-
-            echo "→ Rebuilding bridge service…"
-            # Never restart 'db' — Postgres data must survive deploys.
-            docker compose up -d --build --no-deps bridge
-
-            echo "→ Checking bridge is running…"
-            sleep 8
-            docker compose ps bridge | grep -q "Up" || \
-              (echo "ERROR: bridge container not running" ; docker compose logs --tail=20 bridge ; exit 1)
-
-            echo "→ Deploy complete ✓"
+            echo '→ Rebuilding services…'
+            docker compose up -d --build --no-deps
+            echo '→ Deploy complete ✓'
